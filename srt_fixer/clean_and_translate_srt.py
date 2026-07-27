@@ -71,9 +71,11 @@ MAX_CARACTERES_AMOSTRA_IDIOMA = 30_000
 MAX_TOKENS_TRADUCAO = 65_536
 MAX_TOKENS_ANALISE = 4_096
 
-# Timeout de rede, em segundos. A biblioteca padrão aplica o valor às
-# operações bloqueantes do socket.
-TIMEOUT_REQUISICAO = 360
+# Limite total desejado para uma chamada. Se uma tradução ou auditoria exceder
+# cinco minutos, o lote será subdividido para não permanecer indefinidamente em
+# uma resposta grande. O watchdog também fecha uma resposta cujo corpo continue
+# aberto depois desse limite.
+TIMEOUT_REQUISICAO = 300
 MAX_TENTATIVAS_HTTP = 5
 MAX_TENTATIVAS_FORMATO = 3
 MAX_CICLOS_DE_CORRECAO = 2
@@ -348,6 +350,14 @@ class DeepSeekError(RuntimeError):
 
 class DeepSeekFormatError(DeepSeekError):
     """Resposta recebida, mas incompatível com o formato solicitado."""
+
+
+class DeepSeekRequestTimeoutError(DeepSeekFormatError):
+    """A chamada ultrapassou o limite total e o lote deve ser subdividido."""
+
+
+class DeepSeekRequestDeadline(TimeoutError):
+    """Sinal interno de que o prazo total da chamada terminou."""
 
 
 # ---------------------------------------------------------------------------
@@ -827,11 +837,70 @@ def log_request_heartbeat(
 ) -> None:
     while not stop_event.wait(INTERVALO_LOG_ESPERA):
         elapsed = time.monotonic() - started_at
+        remaining = max(0.0, TIMEOUT_REQUISICAO - elapsed)
         LOG.info(
-            "%s: aguardando resposta da API há %.0fs; processo ativo...",
+            "%s: aguardando resposta da API há %.0fs; processo ativo; "
+            "limite deste pedido em aproximadamente %.0fs.",
             operation,
             elapsed,
+            remaining,
         )
+
+
+def read_response_with_deadline(
+    response: Any,
+    *,
+    deadline: float,
+    operation: str,
+) -> str:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise DeepSeekRequestDeadline(
+            f"{operation} excedeu {TIMEOUT_REQUISICAO}s antes de receber "
+            "o corpo da resposta."
+        )
+
+    expired = threading.Event()
+
+    def close_on_deadline() -> None:
+        expired.set()
+        response_socket = getattr(
+            getattr(getattr(response, "fp", None), "raw", None),
+            "_sock",
+            None,
+        )
+        if response_socket is not None:
+            try:
+                response_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        try:
+            response.close()
+        except OSError:
+            pass
+
+    watchdog = threading.Timer(remaining, close_on_deadline)
+    watchdog.daemon = True
+    watchdog.name = "deepseek-request-deadline"
+    watchdog.start()
+    try:
+        try:
+            body = response.read()
+        except (OSError, ValueError) as error:
+            if expired.is_set():
+                raise DeepSeekRequestDeadline(
+                    f"{operation} excedeu o limite total de "
+                    f"{TIMEOUT_REQUISICAO}s."
+                ) from error
+            raise
+        if expired.is_set() or time.monotonic() >= deadline:
+            raise DeepSeekRequestDeadline(
+                f"{operation} excedeu o limite total de "
+                f"{TIMEOUT_REQUISICAO}s."
+            )
+        return body.decode("utf-8")
+    finally:
+        watchdog.cancel()
 
 
 class DeepSeekClient:
@@ -890,6 +959,8 @@ class DeepSeekClient:
             response_headers: Optional[Mapping[str, str]] = None
             response_status: Optional[int] = None
             started_at = time.monotonic()
+            deadline = started_at + TIMEOUT_REQUISICAO
+            deadline_reached = False
             stop_heartbeat = threading.Event()
             heartbeat = threading.Thread(
                 target=log_request_heartbeat,
@@ -920,11 +991,16 @@ class DeepSeekClient:
                     method="POST",
                 )
                 with urllib.request.urlopen(
-                    request, timeout=TIMEOUT_REQUISICAO
+                    request,
+                    timeout=max(0.1, deadline - time.monotonic()),
                 ) as response:
                     response_status = response.status
                     response_headers = response.headers
-                    raw_body = response.read().decode("utf-8")
+                    raw_body = read_response_with_deadline(
+                        response,
+                        deadline=deadline,
+                        operation=operation,
+                    )
 
                 LOG.info(
                     "%s: resposta recebida em %.1fs; validando...",
@@ -985,12 +1061,22 @@ class DeepSeekClient:
                 last_error = DeepSeekError(
                     f"HTTP {response_status}: {details[:300]}"
                 )
+            except DeepSeekRequestDeadline as error:
+                last_error = error
+                deadline_reached = True
             except (
                 urllib.error.URLError,
                 TimeoutError,
                 socket.timeout,
             ) as error:
-                last_error = error
+                if time.monotonic() >= deadline:
+                    last_error = DeepSeekRequestDeadline(
+                        f"{operation} excedeu o limite total de "
+                        f"{TIMEOUT_REQUISICAO}s."
+                    )
+                    deadline_reached = True
+                else:
+                    last_error = error
             except (
                 json.JSONDecodeError,
                 UnicodeDecodeError,
@@ -1009,6 +1095,14 @@ class DeepSeekClient:
                 if heartbeat.is_alive():
                     heartbeat.join(timeout=1.0)
 
+            if deadline_reached:
+                LOG.warning(
+                    "%s ultrapassou o limite total de %ds. A etapa chamadora "
+                    "tentará recuperar o trabalho com um lote menor.",
+                    operation,
+                    TIMEOUT_REQUISICAO,
+                )
+                break
             if attempt == MAX_TENTATIVAS_HTTP:
                 break
             wait = retry_delay(response_headers, attempt)
@@ -1023,9 +1117,11 @@ class DeepSeekClient:
             time.sleep(wait)
 
         message = (
-            f"{operation} falhou após {MAX_TENTATIVAS_HTTP} tentativas: "
-            f"{last_error}"
+            f"{operation} falhou na tentativa {attempt}/"
+            f"{MAX_TENTATIVAS_HTTP}: {last_error}"
         )
+        if isinstance(last_error, DeepSeekRequestDeadline):
+            raise DeepSeekRequestTimeoutError(message)
         if isinstance(last_error, DeepSeekFormatError):
             raise DeepSeekFormatError(message)
         raise DeepSeekError(message)
@@ -1378,6 +1474,9 @@ Regras obrigatórias:
                 source_texts,
                 formatting_replacements,
             )
+        except DeepSeekRequestTimeoutError:
+            # Não repete o mesmo pedido grande: translate_batch o dividirá.
+            raise
         except DeepSeekFormatError as error:
             last_error = error
             if format_attempt < format_attempts:
@@ -1655,6 +1754,9 @@ Retorne SOMENTE o objeto JSON.
                 texts,
                 formatting_replacements,
             )
+        except DeepSeekRequestTimeoutError:
+            # Não repete o mesmo pedido grande: review_batch o dividirá.
+            raise
         except DeepSeekFormatError as error:
             last_error = error
             if format_attempt < format_attempts:
