@@ -9,10 +9,11 @@ Fluxo:
 3. Remove trechos musicais e descrições não verbais reconhecidas localmente.
 4. Renumera os índices sequencialmente.
 5. Pede ao DeepSeek que identifique o idioma e traduza apenas os textos.
-6. Faz uma revisão final, também pelo DeepSeek, para procurar texto que ainda
-   devesse estar em português.
-7. Valida e grava atomicamente <nome>_traduzido.srt.
-8. Repete o processo para o próximo arquivo somente após concluir o atual.
+6. Valida e grava imediatamente a tradução inicial em
+   <nome>_traduzido.srt.
+7. Faz uma revisão final, também pelo DeepSeek, sobre o arquivo gravado.
+8. Substitui atomicamente o mesmo arquivo pela versão auditada e corrigida.
+9. Repete o processo para o próximo arquivo somente após concluir o atual.
 
 Uso:
     1. Cole uma chave nova em CHAVE_API ou defina DEEPSEEK_API_KEY.
@@ -22,6 +23,7 @@ Uso:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -35,6 +37,7 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (Any, Dict, Iterable, List, Mapping, Optional, Sequence,
@@ -75,6 +78,16 @@ MAX_TENTATIVAS_HTTP = 5
 MAX_TENTATIVAS_FORMATO = 3
 MAX_CICLOS_DE_CORRECAO = 2
 INTERVALO_LOG_ESPERA = 30
+
+# Os lotes da revisão são independentes e podem ser auditados simultaneamente.
+# Três solicitações preservam uma margem conservadora para os limites da API.
+# A tradução inicial permanece sequencial para aproveitar o contexto já
+# traduzido dos lotes anteriores.
+MAX_TRABALHADORES_REVISAO = 3
+
+# Versão do checkpoint que diferencia uma tradução inicial de uma saída que já
+# passou pela auditoria final.
+VERSAO_CHECKPOINT_AUDITORIA = 1
 
 # Além de música, remove descrições autônomas claramente não verbais, como
 # "[risos]" e "(porta batendo)". Falas entre parênteses são preservadas.
@@ -831,6 +844,7 @@ class DeepSeekClient:
         }
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        self._usage_lock = threading.Lock()
 
     def close(self) -> None:
         # Mantém a mesma interface caso o transporte seja trocado no futuro.
@@ -930,10 +944,13 @@ class DeepSeekClient:
                     )
 
                 usage = body.get("usage") or {}
-                self.prompt_tokens += int(usage.get("prompt_tokens") or 0)
-                self.completion_tokens += int(
-                    usage.get("completion_tokens") or 0
-                )
+                with self._usage_lock:
+                    self.prompt_tokens += int(
+                        usage.get("prompt_tokens") or 0
+                    )
+                    self.completion_tokens += int(
+                        usage.get("completion_tokens") or 0
+                    )
 
                 parsed = json.loads(strip_markdown_fence(content))
                 if not isinstance(parsed, dict):
@@ -1781,37 +1798,80 @@ def final_review(
     analysis: Mapping[str, Any],
 ) -> Dict[int, str]:
     """
-    Faz até MAX_CICLOS_DE_CORRECAO ciclos completos e uma confirmação final.
-    Se a revisão continuar propondo mudanças subjetivas, aplica a última rodada
-    validada em vez de descartar toda a tradução.
+    Audita todos os lotes no primeiro ciclo e, depois de uma correção, confirma
+    novamente apenas o lote alterado e seus vizinhos. Os lotes de cada ciclo
+    são independentes e executados em paralelo com concorrência conservadora.
+
+    Se a revisão continuar propondo mudanças subjetivas no último ciclo, aplica
+    a última rodada validada em vez de descartar toda a tradução.
     """
-    total = len(batches)
+    numbered_batches = list(enumerate(batches, start=1))
+    active_batches = numbered_batches
+
     for cycle in range(1, MAX_CICLOS_DE_CORRECAO + 2):
         LOG.info(
-            "Revisão final de português: ciclo %d/%d.",
+            "Revisão final de português: ciclo %d/%d; "
+            "%d lote(s) selecionado(s).",
             cycle,
             MAX_CICLOS_DE_CORRECAO + 1,
+            len(active_batches),
         )
         corrections: Dict[int, str] = {}
-        for number, batch_ids in enumerate(batches, start=1):
+
+        def audit_one(
+            number: int, batch_ids: Sequence[int]
+        ) -> Dict[int, str]:
             LOG.info(
                 "Verificando lote %d/%d (entradas %d-%d)...",
                 number,
-                total,
+                len(batches),
                 batch_ids[0],
                 batch_ids[-1],
             )
-            corrections.update(
-                review_batch(
-                    client,
-                    batch_number=number,
-                    batch_ids=batch_ids,
-                    texts=texts,
-                    source_texts=source_texts,
-                    analysis=analysis,
-                    cycle=cycle,
-                )
+            return review_batch(
+                client,
+                batch_number=number,
+                batch_ids=batch_ids,
+                texts=texts,
+                source_texts=source_texts,
+                analysis=analysis,
+                cycle=cycle,
             )
+
+        workers = min(MAX_TRABALHADORES_REVISAO, len(active_batches))
+        if workers <= 1:
+            for number, batch_ids in active_batches:
+                corrections.update(audit_one(number, batch_ids))
+        else:
+            LOG.info(
+                "Auditoria do ciclo %d em paralelo: até %d solicitações "
+                "simultâneas; tradução inicial continua sequencial.",
+                cycle,
+                workers,
+            )
+            completed_batches = 0
+            with ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="srt-review",
+            ) as executor:
+                futures: Dict[Future[Dict[int, str]], int] = {
+                    executor.submit(audit_one, number, batch_ids): number
+                    for number, batch_ids in active_batches
+                }
+                try:
+                    for future in as_completed(futures):
+                        corrections.update(future.result())
+                        completed_batches += 1
+                        LOG.info(
+                            "Progresso da auditoria: %d/%d lote(s) "
+                            "selecionado(s) concluído(s).",
+                            completed_batches,
+                            len(active_batches),
+                        )
+                except BaseException:
+                    for future in futures:
+                        future.cancel()
+                    raise
 
         if not corrections:
             LOG.info(
@@ -1834,6 +1894,28 @@ def final_review(
             len(corrections),
         )
         texts.update(corrections)
+
+        changed_batch_positions = {
+            position
+            for position, (_, batch_ids) in enumerate(numbered_batches)
+            if any(cue_id in corrections for cue_id in batch_ids)
+        }
+        selected_positions = {
+            neighbor
+            for position in changed_batch_positions
+            for neighbor in (position - 1, position, position + 1)
+            if 0 <= neighbor < len(numbered_batches)
+        }
+        active_batches = [
+            numbered_batches[position]
+            for position in sorted(selected_positions)
+        ]
+        LOG.info(
+            "Próximo ciclo: %d/%d lote(s) serão reavaliados "
+            "(lotes corrigidos e vizinhos).",
+            len(active_batches),
+            len(numbered_batches),
+        )
 
     raise AssertionError("Fluxo de revisão inalcançável.")
 
@@ -1865,6 +1947,12 @@ def output_path_for(input_path: Path) -> Path:
     return input_path.with_name(f"{input_path.stem}_traduzido.srt")
 
 
+def audit_checkpoint_path_for(output_path: Path) -> Path:
+    return output_path.with_name(
+        f".{output_path.stem}.auditoria_pendente.json"
+    )
+
+
 def atomic_write(path: Path, content: str) -> None:
     temporary_name: Optional[str] = None
     try:
@@ -1889,6 +1977,121 @@ def atomic_write(path: Path, content: str) -> None:
             except OSError:
                 pass
         raise
+
+
+def source_signature(cues: Sequence[Cue]) -> str:
+    digest = hashlib.sha256()
+    for cue in cues:
+        digest.update(cue.timestamp.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(cue.text.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def write_audit_checkpoint(
+    path: Path,
+    *,
+    input_path: Path,
+    output_path: Path,
+    cues: Sequence[Cue],
+    analysis: Mapping[str, Any],
+) -> None:
+    data = {
+        "version": VERSAO_CHECKPOINT_AUDITORIA,
+        "stage": "audit_pending",
+        "input_name": input_path.name,
+        "output_name": output_path.name,
+        "source_signature": source_signature(cues),
+        "analysis": dict(analysis),
+    }
+    atomic_write(
+        path,
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+def load_audit_checkpoint(
+    path: Path,
+    *,
+    input_path: Path,
+    output_path: Path,
+    cues: Sequence[Cue],
+) -> Dict[str, Any]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SRTError(
+            f"O checkpoint de auditoria {path.name} está ilegível: {error}"
+        ) from error
+
+    if not isinstance(data, dict):
+        raise SRTError(
+            f"O checkpoint de auditoria {path.name} não é um objeto JSON."
+        )
+
+    expected = {
+        "version": VERSAO_CHECKPOINT_AUDITORIA,
+        "stage": "audit_pending",
+        "input_name": input_path.name,
+        "output_name": output_path.name,
+        "source_signature": source_signature(cues),
+    }
+    mismatched = [
+        key for key, value in expected.items() if data.get(key) != value
+    ]
+    if mismatched:
+        raise SRTError(
+            "O checkpoint de auditoria não corresponde ao arquivo-fonte "
+            f"atual (campos: {', '.join(mismatched)})."
+        )
+
+    analysis = data.get("analysis")
+    if not isinstance(analysis, dict):
+        raise SRTError(
+            "O checkpoint de auditoria não contém a análise de idioma."
+        )
+    required_strings = (
+        "language_name",
+        "language_code",
+        "regional_variant",
+        "content_summary",
+        "register",
+    )
+    if any(not isinstance(analysis.get(key), str) for key in required_strings):
+        raise SRTError(
+            "A análise de idioma salva no checkpoint está incompleta."
+        )
+    if not isinstance(analysis.get("is_portuguese"), bool):
+        raise SRTError(
+            "O idioma salvo no checkpoint não possui is_portuguese válido."
+        )
+    for key in ("proper_names", "preserve_terms"):
+        if not isinstance(analysis.get(key), list):
+            raise SRTError(
+                f"A análise salva no checkpoint não possui {key} válido."
+            )
+    return analysis
+
+
+def load_output_texts_for_audit(
+    output_path: Path, source_cues: Sequence[Cue]
+) -> Dict[int, str]:
+    content, encoding = read_text_with_fallback(output_path)
+    output_cues = parse_srt(content)
+    texts = {
+        cue_id: cue.text
+        for cue_id, cue in enumerate(output_cues, start=1)
+    }
+    validate_rendered_srt(content, source_cues, texts)
+    LOG.info(
+        "Versão a auditar recarregada de %s (%s): %d entradas validadas.",
+        output_path.name,
+        encoding,
+        len(texts),
+    )
+    return texts
 
 
 def log_cleaning(stats: CleaningStats) -> None:
@@ -1920,6 +2123,7 @@ def log_cleaning(stats: CleaningStats) -> None:
 def process_file(client: DeepSeekClient, input_path: Path) -> Path:
     started_at = time.monotonic()
     output_path = output_path_for(input_path)
+    checkpoint_path = audit_checkpoint_path_for(output_path)
 
     content, encoding = read_text_with_fallback(input_path)
     LOG.info(
@@ -1942,28 +2146,76 @@ def process_file(client: DeepSeekClient, input_path: Path) -> Path:
     review_batches = build_batches(
         cues, MAX_CARACTERES_POR_LOTE_REVISAO
     )
-    LOG.info(
-        "Plano da API: 1 análise de idioma, %d lote(s) de tradução e "
-        "revisão final em %d lote(s).",
-        len(translation_batches),
-        len(review_batches),
-    )
-
-    LOG.info("Identificando idioma original e contexto com %s...", MODELO)
-    analysis = analyze_language_and_context(client, cues)
-    LOG.info(
-        "Idioma identificado: %s (%s), variante: %s.",
-        analysis["language_name"],
-        analysis["language_code"],
-        analysis["regional_variant"],
-    )
-
-    translated = translate_all(
-        client, cues, translation_batches, analysis
-    )
     source_texts = {
         cue_id: cue.text for cue_id, cue in enumerate(cues, start=1)
     }
+
+    resume_audit = (
+        checkpoint_path.exists()
+        and output_path.exists()
+        and not SOBRESCREVER_SAIDA
+    )
+    if resume_audit:
+        LOG.info(
+            "Checkpoint encontrado: retomando diretamente a auditoria de %s.",
+            output_path.name,
+        )
+        analysis = load_audit_checkpoint(
+            checkpoint_path,
+            input_path=input_path,
+            output_path=output_path,
+            cues=cues,
+        )
+        translated = load_output_texts_for_audit(output_path, cues)
+        LOG.info(
+            "Plano de retomada da API: 0 lotes de tradução; "
+            "auditoria em %d lote(s).",
+            len(review_batches),
+        )
+    else:
+        LOG.info(
+            "Plano da API: 1 análise de idioma, %d lote(s) de tradução e "
+            "revisão final em %d lote(s).",
+            len(translation_batches),
+            len(review_batches),
+        )
+
+        LOG.info("Identificando idioma original e contexto com %s...", MODELO)
+        analysis = analyze_language_and_context(client, cues)
+        LOG.info(
+            "Idioma identificado: %s (%s), variante: %s.",
+            analysis["language_name"],
+            analysis["language_code"],
+            analysis["regional_variant"],
+        )
+
+        translated = translate_all(
+            client, cues, translation_batches, analysis
+        )
+        initial_content = render_srt(cues, translated)
+        validate_rendered_srt(initial_content, cues, translated)
+
+        # O marcador é criado primeiro. Assim, depois que o SRT inicial existir,
+        # uma interrupção nunca fará essa versão ser confundida com a auditada.
+        write_audit_checkpoint(
+            checkpoint_path,
+            input_path=input_path,
+            output_path=output_path,
+            cues=cues,
+            analysis=analysis,
+        )
+        atomic_write(output_path, initial_content)
+        LOG.info(
+            "Tradução inicial gravada e validada: %s. "
+            "A auditoria começará agora sobre esse arquivo.",
+            output_path.name,
+        )
+        LOG.info(
+            "Se o processo for interrompido durante a auditoria, a próxima "
+            "execução retomará deste checkpoint."
+        )
+        translated = load_output_texts_for_audit(output_path, cues)
+
     reviewed = final_review(
         client,
         review_batches,
@@ -1982,6 +2234,12 @@ def process_file(client: DeepSeekClient, input_path: Path) -> Path:
         len(cues),
     )
     atomic_write(output_path, output_content)
+    checkpoint_path.unlink(missing_ok=True)
+    LOG.info(
+        "Auditoria concluída: %s foi substituído atomicamente pela versão "
+        "auditada e corrigida.",
+        output_path.name,
+    )
     LOG.info(
         "Arquivo concluído em %.1f min: %s",
         (time.monotonic() - started_at) / 60,
@@ -2000,13 +2258,22 @@ def run() -> Tuple[int, int, int]:
     skipped = 0
     for input_path in input_paths:
         output_path = output_path_for(input_path)
+        checkpoint_path = audit_checkpoint_path_for(output_path)
         if output_path.exists() and not SOBRESCREVER_SAIDA:
-            skipped += 1
-            LOG.info(
-                "Ignorando %s: a saída %s já existe.",
-                input_path.name,
-                output_path.name,
-            )
+            if checkpoint_path.exists():
+                pending.append(input_path)
+                LOG.info(
+                    "Retomada pendente: %s existe, mas ainda precisa passar "
+                    "pela auditoria final.",
+                    output_path.name,
+                )
+            else:
+                skipped += 1
+                LOG.info(
+                    "Ignorando %s: a saída auditada %s já existe.",
+                    input_path.name,
+                    output_path.name,
+                )
         else:
             pending.append(input_path)
 
